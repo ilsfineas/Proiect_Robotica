@@ -1,329 +1,139 @@
-"""
-Maze Solver - Pioneer P3-DX
-CoppeliaSim + Python ZMQ Remote API
-
-Strategie:
-- wall following pe peretele drept
-- evitare simplă obstacole
-- oprire la finish
-
-Versiune stabilă pentru labirinturi simple.
-"""
-
-from __future__ import annotations
-
-import math
 import time
-
+import math
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
+# --- PARAMETRI GLOBALI ---
+START_POS = [+8.425, +10.925, 0.139]
+FINISH_POS = [-0.550, +3.375]  
+FINISH_RADIUS = 0.25 # Distanta (metri) considerata "succes" fata de centrul patratului negru
 
-# =========================================================
-# CONFIG
-# =========================================================
+V_FORWARD = 2.0
+V_TURN = 1.5
+WALL_THRESH = 0.4    # Distanta la care consideram ca exista un zid
+CELL_SIZE = 0.5      # Dimensiunea grilei pentru rotunjirea coordonatelor in memorie
 
-START_POS = [-1.075, 0.650, 0.139]
-FINISH_POS = [0.725, -0.350]
+# Memoria globala a "robotilor" anteriori
+dead_ends = set()
 
-GOAL_TOLERANCE = 0.15
+# Gruparea senzorilor
+FRONT_SENSORS = [3, 4]       
+LEFT_SENSORS = [0, 1, 14, 15]
+RIGHT_SENSORS = [6, 7, 8, 9] 
 
-RESET_ROBOT_TO_START = True
+def discretize_pos(pos):
+    """Transforma o coordonata continua intr-un nod de grila pentru memorie."""
+    return (round(pos[0] / CELL_SIZE), round(pos[1] / CELL_SIZE))
 
-# =========================================================
-# ROBOT PATHS
-# =========================================================
-
-ROBOT_PATH = "/PioneerP3DX"
-
-LEFT_MOTOR_PATH = "/PioneerP3DX/leftMotor"
-RIGHT_MOTOR_PATH = "/PioneerP3DX/rightMotor"
-
-SENSOR_PATH_TEMPLATE = "/PioneerP3DX/ultrasonicSensor[{index}]"
-
-# =========================================================
-# SENSOR GROUPS
-# =========================================================
-
-# conform documentatie laborator
-FRONT_SENSORS = [3, 4]
-
-RIGHT_SENSORS = [8, 9]
-
-# =========================================================
-# CONTROL PARAMETERS
-# =========================================================
-
-SENSOR_MAX = 1.0
-
-V_BASE = 2.0
-
-TARGET_DIST = 0.35
-
-K_P = 3.0
-
-FRONT_STOP = 0.30
-
-MAX_SPEED = 4.0
-
-STATUS_PERIOD = 0.5
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def euclidean_2d(a, b):
-    return math.hypot(b[0] - a[0], b[1] - a[1])
-
-
-def read_min_dist(sim, sensors, indices):
-
-    min_dist = SENSOR_MAX
-
+def get_min_dist(sim, sensors, indices):
+    """Returneaza distanta minima pentru un grup de senzori."""
+    min_dist = 1.0
     for idx in indices:
-
         result, dist, *_ = sim.readProximitySensor(sensors[idx])
-
         if result and dist < min_dist:
             min_dist = dist
-
     return min_dist
 
-
-def set_velocity(sim, left_motor, right_motor, v_left, v_right):
-
-    v_left = clamp(v_left, -MAX_SPEED, MAX_SPEED)
-    v_right = clamp(v_right, -MAX_SPEED, MAX_SPEED)
-
-    sim.setJointTargetVelocity(left_motor, v_left)
-    sim.setJointTargetVelocity(right_motor, v_right)
-
-
-# =========================================================
-# MAIN
-# =========================================================
+def spawn_new_robot(sim, robot, left_motor, right_motor):
+    """Opreste motoarele si teleporteaza robotul inapoi la start (Noua iteratie)."""
+    print("\n--- SPAWN ROBOT NOU LA START ---")
+    sim.setJointTargetVelocity(left_motor, 0.0)
+    sim.setJointTargetVelocity(right_motor, 0.0)
+    time.sleep(0.5)
+    
+    # Teleportare la start
+    sim.setObjectPosition(robot, sim.handle_world, START_POS)
+    # Resetare orientare (cu fata in directia initiala)
+    sim.setObjectOrientation(robot, sim.handle_world, [0, 0, 0])
+    time.sleep(1.0) # Pauza de stabilizare fizica
 
 def main():
-
-    print("Conectare la CoppeliaSim...")
-
     client = RemoteAPIClient()
-    sim = client.require("sim")
+    sim = client.require('sim')
 
-    # -----------------------------------------------------
-
-    robot = sim.getObject(ROBOT_PATH)
-
-    left_motor = sim.getObject(LEFT_MOTOR_PATH)
-    right_motor = sim.getObject(RIGHT_MOTOR_PATH)
-
-    sensors = [
-        sim.getObject(
-            SENSOR_PATH_TEMPLATE.format(index=i)
-        )
-        for i in range(16)
-    ]
-
-    # -----------------------------------------------------
-
-    if RESET_ROBOT_TO_START:
-
-        sim.setObjectPosition(
-            robot,
-            sim.handle_world,
-            START_POS
-        )
-
-    # -----------------------------------------------------
+    # Obtinere handle-uri
+    robot = sim.getObject('/PioneerP3DX')
+    left_motor = sim.getObject('/PioneerP3DX/leftMotor')
+    right_motor = sim.getObject('/PioneerP3DX/rightMotor')
+    sensors = [sim.getObject(f'/PioneerP3DX/ultrasonicSensor[{i}]') for i in range(16)]
 
     sim.startSimulation()
+    print("=== START EXPLORARE LABIRINT ===")
+    
+    # Asigura-te ca incepem de la punctul de start setat de tine
+    spawn_new_robot(sim, robot, left_motor, right_motor)
 
-    print("Simulare pornita.")
-    print("Wall following pe peretele drept.")
-    print()
-
-    last_status_time = -1.0
-
+    iteration = 1
+    
     try:
-
         while True:
-
-            current_time = sim.getSimulationTime()
-
-            # =================================================
-            # POZITIE ROBOT
-            # =================================================
-
-            pos = sim.getObjectPosition(
-                robot,
-                sim.handle_world
-            )
-
-            goal_distance = euclidean_2d(
-                pos,
-                FINISH_POS
-            )
-
-            # =================================================
-            # FINISH
-            # =================================================
-
-            if goal_distance <= GOAL_TOLERANCE:
-
-                set_velocity(
-                    sim,
-                    left_motor,
-                    right_motor,
-                    0.0,
-                    0.0
-                )
-
-                print()
-                print("===================================")
-                print("FINISH GASIT")
-                print(f"x = {pos[0]:+.3f}")
-                print(f"y = {pos[1]:+.3f}")
-                print("===================================")
-
+            # 1. VERIFICARE SUCCES (A ajuns la patratul negru?)
+            pos = sim.getObjectPosition(robot, sim.handle_world)
+            dist_to_finish = math.dist([pos[0], pos[1]], FINISH_POS)
+            
+            if dist_to_finish < FINISH_RADIUS:
+                print(f"\n[SUCCES] Labirint rezolvat din {iteration} iteratii!")
+                sim.setJointTargetVelocity(left_motor, 0.0)
+                sim.setJointTargetVelocity(right_motor, 0.0)
                 break
 
-            # =================================================
-            # SENZORI
-            # =================================================
+            # 2. CITIRE SENZORI
+            d_front = get_min_dist(sim, sensors, FRONT_SENSORS)
+            d_left = get_min_dist(sim, sensors, LEFT_SENSORS)
+            d_right = get_min_dist(sim, sensors, RIGHT_SENSORS)
 
-            dist_front = read_min_dist(
-                sim,
-                sensors,
-                FRONT_SENSORS
-            )
+            # 3. VERIFICARE INFUNDATURA (DEAD END)
+            if d_front < WALL_THRESH and d_left < WALL_THRESH and d_right < WALL_THRESH:
+                current_grid = discretize_pos(pos)
+                print(f"[INFUNDATURA] Detectata la grila {current_grid}. Memorez...")
+                dead_ends.add(current_grid)
+                
+                iteration += 1
+                spawn_new_robot(sim, robot, left_motor, right_motor)
+                continue
 
-            dist_right = read_min_dist(
-                sim,
-                sensors,
-                RIGHT_SENSORS
-            )
+            # 4. LOGICA DE NAVIGARE SI EVITARE MEMORATA
+            # Daca drumul in fata e blocat, trebuie sa alegem o directie
+            if d_front < WALL_THRESH:
+                # Estimam coordonatele grilei din stanga si din dreapta
+                # (O euristica simpla: adunam un offset la coordonatele curente bazat pe orientare)
+                ori = sim.getObjectOrientation(robot, sim.handle_world)
+                yaw = ori[2]
+                
+                grid_left = discretize_pos([pos[0] - math.sin(yaw)*0.5, pos[1] + math.cos(yaw)*0.5])
+                grid_right = discretize_pos([pos[0] + math.sin(yaw)*0.5, pos[1] - math.cos(yaw)*0.5])
 
-            # =================================================
-            # LOGICA CONTROL
-            # =================================================
-
-            # -------------------------------------------------
-            # obstacol frontal
-            # -------------------------------------------------
-
-            if dist_front < FRONT_STOP:
-
-                v_left = -V_BASE
-                v_right = +V_BASE
-
-                state = (
-                    f"TURN LEFT  "
-                    f"front={dist_front:.3f}"
-                )
-
-            # -------------------------------------------------
-            # nu exista perete la dreapta
-            # -------------------------------------------------
-
-            elif dist_right >= SENSOR_MAX * 0.95:
-
-                v_left = V_BASE
-                v_right = V_BASE * 0.65
-
-                state = "SEARCH WALL"
-
-            # -------------------------------------------------
-            # wall following
-            # -------------------------------------------------
-
-            else:
-
-                error = dist_right - TARGET_DIST
-
-                v_left = V_BASE + K_P * error
-                v_right = V_BASE - K_P * error
-
-                state = (
-                    f"FOLLOW  "
-                    f"right={dist_right:.3f} "
-                    f"err={error:+.3f}"
-                )
-
-            # =================================================
-            # LIMITARE VITEZE
-            # =================================================
-
-            v_left = clamp(v_left, -MAX_SPEED, MAX_SPEED)
-            v_right = clamp(v_right, -MAX_SPEED, MAX_SPEED)
-
-            # =================================================
-            # COMANDA MOTOARE
-            # =================================================
-
-            set_velocity(
-                sim,
-                left_motor,
-                right_motor,
-                v_left,
-                v_right
-            )
-
-            # =================================================
-            # DEBUG
-            # =================================================
-
-            if current_time - last_status_time >= STATUS_PERIOD:
-
-                print(
-                    f"[{state:<30}] "
-                    f"goal={goal_distance:.3f} "
-                    f"front={dist_front:.3f} "
-                    f"right={dist_right:.3f} "
-                    f"vL={v_left:+.2f} "
-                    f"vR={v_right:+.2f}"
-                )
-
-                last_status_time = current_time
-
-            # =================================================
-
-            sensor_values = []
-
-            for i in range(16):
-                result, dist, *_ = sim.readProximitySensor(sensors[i])
-                if result:
-                    sensor_values.append(round(dist, 3))
+                # Verificam memoria
+                if grid_left in dead_ends:
+                    print("Stanga e marcata ca infundatura! Virez dreapta.")
+                    v_left, v_right = V_TURN, -V_TURN
+                elif grid_right in dead_ends:
+                    print("Dreapta e marcata ca infundatura! Virez stanga.")
+                    v_left, v_right = -V_TURN, V_TURN
                 else:
-                    sensor_values.append(None)
-            print(sensor_values)
+                    # Niciuna nu e cunoscuta ca infundatura, alegem calea mai libera
+                    if d_left > d_right:
+                        v_left, v_right = -V_TURN, V_TURN
+                    else:
+                        v_left, v_right = V_TURN, -V_TURN
+            else:
+                # Mers inainte cu un usor wall-following pentru a merge drept
+                error = d_right - d_left
+                v_left = V_FORWARD - 0.5 * error
+                v_right = V_FORWARD + 0.5 * error
 
-            time.sleep(0.05)
-            for i, d in enumerate(sensor_values):
-                print(f"S{i}: {d}")
+            # Aplicare viteze
+            sim.setJointTargetVelocity(left_motor, v_left)
+            sim.setJointTargetVelocity(right_motor, v_right)
+
+            time.sleep(0.05) # Bucla de 20Hz
 
     except KeyboardInterrupt:
-
-        print("\nProgram intrerupt manual.")
-
+        print("\nExplorare oprita manual.")
     finally:
-
-        set_velocity(
-            sim,
-            left_motor,
-            right_motor,
-            0.0,
-            0.0
-        )
-
+        # Oprire garantata
+        sim.setJointTargetVelocity(left_motor, 0.0)
+        sim.setJointTargetVelocity(right_motor, 0.0)
         sim.stopSimulation()
 
-        print("Simulare oprita.")
-
-
-# =========================================================
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
