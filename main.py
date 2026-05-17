@@ -1,205 +1,329 @@
-import time
+"""
+Maze Solver - Pioneer P3-DX
+CoppeliaSim + Python ZMQ Remote API
+
+Strategie:
+- wall following pe peretele drept
+- evitare simplă obstacole
+- oprire la finish
+
+Versiune stabilă pentru labirinturi simple.
+"""
+
+from __future__ import annotations
+
 import math
-from pathlib import Path
+import time
+
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
-# --- Configurații Labirint și Roi ---
-START_POS  = [0.975, 1.000, 0.139] # Coordonatele tale de start (Z-ul este înălțimea)
-FINISH_POS = [-0.745, -0.225]      # Coordonatele tale de final (X, Y)
-FINISH_RADIUS = 0.4                # Marja de eroare pentru finish
 
-# Modelul este stocat în folderul local models/
-MODEL_PATH = (Path(__file__).resolve().parent / "models" / "PioneerP3DX.ttm").as_posix()
+# =========================================================
+# CONFIG
+# =========================================================
 
-V_FORWARD = 2.0         # rad/s - viteza de deplasare înainte
-V_TURN = 2.0            # rad/s - viteza de viraj
-TIME_CELL = 2.5         # Timp pentru a avansa o "celulă"
-TIME_TURN_90 = 1.57     # Timp pentru un viraj de ~90 grade
-THRESHOLD_WALL = 0.6    # Pragul sub care un senzor consideră că e un obstacol
+START_POS = [-1.075, 0.650, 0.139]
+FINISH_POS = [0.725, -0.350]
 
-# Mapping senzori în grupuri (acoperire circulară). Ajustează dacă modelul
-# are o distribuirre diferită a senzorilor.
-SENSOR_GROUPS = {
-    'Stanga': [11,12,13,14,15,0],
-    'Fata':   [1,2,3,4,5],
-    'Dreapta':[6,7,8,9,10]
-}
+GOAL_TOLERANCE = 0.15
+
+RESET_ROBOT_TO_START = True
+
+# =========================================================
+# ROBOT PATHS
+# =========================================================
+
+ROBOT_PATH = "/PioneerP3DX"
+
+LEFT_MOTOR_PATH = "/PioneerP3DX/leftMotor"
+RIGHT_MOTOR_PATH = "/PioneerP3DX/rightMotor"
+
+SENSOR_PATH_TEMPLATE = "/PioneerP3DX/ultrasonicSensor[{index}]"
+
+# =========================================================
+# SENSOR GROUPS
+# =========================================================
+
+# conform documentatie laborator
+FRONT_SENSORS = [3, 4]
+
+RIGHT_SENSORS = [8, 9]
+
+# =========================================================
+# CONTROL PARAMETERS
+# =========================================================
+
+SENSOR_MAX = 1.0
+
+V_BASE = 2.0
+
+TARGET_DIST = 0.35
+
+K_P = 3.0
+
+FRONT_STOP = 0.30
+
+MAX_SPEED = 4.0
+
+STATUS_PERIOD = 0.5
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
-class RobotInstance:
-    def __init__(self, sim, robot_handle):
-        self.sim = sim
-        self.handle = robot_handle
-        
-        # Obținem alias-ul generat automat (ex: PioneerP3DX#0) pentru a-i găsi corect copiii
-        alias = self.sim.getObjectAlias(self.handle)
-        
-        # Căutăm motoarele și senzorii specifici acestei instanțe
-        self.left_motor = self.sim.getObject(f'/{alias}/leftMotor')
-        self.right_motor = self.sim.getObject(f'/{alias}/rightMotor')
-        
-        self.sensors = [
-            self.sim.getObject(f'/{alias}/ultrasonicSensor[{i}]') for i in range(16)
-        ]
+def euclidean_2d(a, b):
+    return math.hypot(b[0] - a[0], b[1] - a[1])
 
-    def set_motors(self, v_left, v_right):
-        self.sim.setJointTargetVelocity(self.left_motor, v_left)
-        self.sim.setJointTargetVelocity(self.right_motor, v_right)
 
-    def stop(self):
-        self.set_motors(0.0, 0.0)
-        time.sleep(0.5)
+def read_min_dist(sim, sensors, indices):
 
-    def move_forward(self):
-        self.set_motors(V_FORWARD, V_FORWARD)
-        time.sleep(TIME_CELL)
-        self.stop()
+    min_dist = SENSOR_MAX
 
-    def turn(self, direction):
-        if direction == 'Dreapta':
-            self.set_motors(V_TURN, -V_TURN)
-        elif direction == 'Stanga':
-            self.set_motors(-V_TURN, V_TURN)
-        elif direction == 'Inapoi': 
-            self.set_motors(V_TURN, -V_TURN)
-            time.sleep(TIME_TURN_90 * 2)
-            self.stop()
-            return
-            
-        time.sleep(TIME_TURN_90)
-        self.stop()
+    for idx in indices:
 
-    def get_min_distance(self, indices):
-        """Returnează distanța minimă detectată de un grup de senzori."""
-        min_dist = 1.0 # Considerăm 1.0m ca fiind drum liber maxim
-        for idx in indices:
-            res, dist, *_ = self.sim.readProximitySensor(self.sensors[idx])
-            if res and dist < min_dist:
-                min_dist = dist
-        return min_dist
+        result, dist, *_ = sim.readProximitySensor(sensors[idx])
 
-    def scan_intersections(self):
-        # Citim toți senzorii pentru debugging detaliat (utile pentru mapare)
-        alias = self.sim.getObjectAlias(self.handle)
-        per_sensor = []
-        for idx in range(len(self.sensors)):
-            res, dist, *_ = self.sim.readProximitySensor(self.sensors[idx])
-            if not res:
-                dist = 1.0
-            per_sensor.append((idx, dist))
-        # Afișăm citirile (scurt)
-        per_str = ', '.join([f"{i}:{d:.2f}" for i,d in per_sensor])
-        print(f"[{alias}] senzori -> {per_str}")
+        if result and dist < min_dist:
+            min_dist = dist
 
-        # Calculăm distanțele minime pe grupuri definite mai sus
-        dist_l = self.get_min_distance(SENSOR_GROUPS['Stanga'])
-        dist_f = self.get_min_distance(SENSOR_GROUPS['Fata'])
-        dist_r = self.get_min_distance(SENSOR_GROUPS['Dreapta'])
-        print(f"[{alias}] Vede -> Stanga: {dist_l:.2f}m | Fata: {dist_f:.2f}m | Dreapta: {dist_r:.2f}m")
+    return min_dist
 
-        available_directions = []
-        # Regula priorității: Dreapta -> Înainte -> Stânga
-        if dist_r > THRESHOLD_WALL:
-            available_directions.append('Dreapta')
-        if dist_f > THRESHOLD_WALL:
-            available_directions.append('Inainte')
-        if dist_l > THRESHOLD_WALL:
-            available_directions.append('Stanga')
 
-        return available_directions
+def set_velocity(sim, left_motor, right_motor, v_left, v_right):
 
-    def is_at_finish(self):
-        pos = self.sim.getObjectPosition(self.handle, self.sim.handle_world)
-        dist = math.sqrt((pos[0] - FINISH_POS[0])**2 + (pos[1] - FINISH_POS[1])**2)
-        return dist < FINISH_RADIUS
+    v_left = clamp(v_left, -MAX_SPEED, MAX_SPEED)
+    v_right = clamp(v_right, -MAX_SPEED, MAX_SPEED)
 
-    def run_until_stuck_or_finish(self):
-        while True:
-            if self.is_at_finish():
-                return "FINISH"
+    sim.setJointTargetVelocity(left_motor, v_left)
+    sim.setJointTargetVelocity(right_motor, v_right)
 
-            options = self.scan_intersections()
 
-            if len(options) == 0:
-                self.stop()
-                return "INFUNDATURA" # Rămâne pe loc și devine perete
-
-            alias = self.sim.getObjectAlias(self.handle)
-            # Încercăm fiecare opțiune în ordinea priorității, dar testăm sigur
-            moved = False
-            for chosen_direction in options:
-                print(f"[{alias}] Încearcă: {chosen_direction}")
-                # executăm virajul temporar (dacă este cazul)
-                turned = False
-                if chosen_direction != 'Inainte':
-                    self.turn(chosen_direction)
-                    turned = True
-
-                # după viraj, verificăm dacă fața (grupul front) e liberă
-                front_clear = self.get_min_distance(SENSOR_GROUPS['Fata']) > THRESHOLD_WALL
-                print(f"[{alias}] Front clear after turn: {front_clear}")
-
-                if front_clear:
-                    # putem merge înainte
-                    self.move_forward()
-                    moved = True
-                    break
-                else:
-                    # dacă am întors și nu e liber, revenim la orientarea anterioară
-                    if turned:
-                        # inversăm virajul: Dreapta <-> Stanga
-                        if chosen_direction == 'Dreapta':
-                            self.turn('Stanga')
-                        elif chosen_direction == 'Stanga':
-                            self.turn('Dreapta')
-                        else:
-                            # pentru orice alt caz (safety)
-                            self.turn('Inapoi')
-                    # continuăm la următoarea opțiune
-
-            if not moved:
-                # Niciuna din opțiuni nu a permis un pas sigur
-                self.stop()
-                return "INFUNDATURA"
-
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
-    if not Path(MODEL_PATH).exists():
-        raise FileNotFoundError(f"Modelul nu a fost găsit: {MODEL_PATH}")
+
+    print("Conectare la CoppeliaSim...")
 
     client = RemoteAPIClient()
-    sim = client.require('sim')
+    sim = client.require("sim")
+
+    # -----------------------------------------------------
+
+    robot = sim.getObject(ROBOT_PATH)
+
+    left_motor = sim.getObject(LEFT_MOTOR_PATH)
+    right_motor = sim.getObject(RIGHT_MOTOR_PATH)
+
+    sensors = [
+        sim.getObject(
+            SENSOR_PATH_TEMPLATE.format(index=i)
+        )
+        for i in range(16)
+    ]
+
+    # -----------------------------------------------------
+
+    if RESET_ROBOT_TO_START:
+
+        sim.setObjectPosition(
+            robot,
+            sim.handle_world,
+            START_POS
+        )
+
+    # -----------------------------------------------------
 
     sim.startSimulation()
-    print("Simularea a început. Generăm roboți până rezolvăm labirintul...")
-    time.sleep(1)
 
-    max_robots = 50 
-    
+    print("Simulare pornita.")
+    print("Wall following pe peretele drept.")
+    print()
+
+    last_status_time = -1.0
+
     try:
-        for i in range(max_robots):
-            print(f"\n--- Spawnare Robot #{i+1} la Start ---")
-            
-            robot_handle = sim.loadModel(MODEL_PATH)
-            
-            sim.setObjectPosition(robot_handle, sim.handle_world, START_POS)
-            sim.setObjectOrientation(robot_handle, sim.handle_world, [0, 0, 0])
-            time.sleep(0.5) 
 
-            robot = RobotInstance(sim, robot_handle)
-            rezultat = robot.run_until_stuck_or_finish()
+        while True:
 
-            if rezultat == "FINISH":
-                print(f"🎉 SUCCES! Robotul #{i+1} a găsit calea către Finish!")
+            current_time = sim.getSimulationTime()
+
+            # =================================================
+            # POZITIE ROBOT
+            # =================================================
+
+            pos = sim.getObjectPosition(
+                robot,
+                sim.handle_world
+            )
+
+            goal_distance = euclidean_2d(
+                pos,
+                FINISH_POS
+            )
+
+            # =================================================
+            # FINISH
+            # =================================================
+
+            if goal_distance <= GOAL_TOLERANCE:
+
+                set_velocity(
+                    sim,
+                    left_motor,
+                    right_motor,
+                    0.0,
+                    0.0
+                )
+
+                print()
+                print("===================================")
+                print("FINISH GASIT")
+                print(f"x = {pos[0]:+.3f}")
+                print(f"y = {pos[1]:+.3f}")
+                print("===================================")
+
                 break
-            else:
-                print(f"❌ Robotul #{i+1} a ajuns într-o înfundătură și va bloca drumul.")
-                
-    except KeyboardInterrupt:
-        print("\nOprit manual din consolă.")
-    finally:
-        sim.stopSimulation()
-        print("Simularea s-a oprit.")
 
-if __name__ == '__main__':
+            # =================================================
+            # SENZORI
+            # =================================================
+
+            dist_front = read_min_dist(
+                sim,
+                sensors,
+                FRONT_SENSORS
+            )
+
+            dist_right = read_min_dist(
+                sim,
+                sensors,
+                RIGHT_SENSORS
+            )
+
+            # =================================================
+            # LOGICA CONTROL
+            # =================================================
+
+            # -------------------------------------------------
+            # obstacol frontal
+            # -------------------------------------------------
+
+            if dist_front < FRONT_STOP:
+
+                v_left = -V_BASE
+                v_right = +V_BASE
+
+                state = (
+                    f"TURN LEFT  "
+                    f"front={dist_front:.3f}"
+                )
+
+            # -------------------------------------------------
+            # nu exista perete la dreapta
+            # -------------------------------------------------
+
+            elif dist_right >= SENSOR_MAX * 0.95:
+
+                v_left = V_BASE
+                v_right = V_BASE * 0.65
+
+                state = "SEARCH WALL"
+
+            # -------------------------------------------------
+            # wall following
+            # -------------------------------------------------
+
+            else:
+
+                error = dist_right - TARGET_DIST
+
+                v_left = V_BASE + K_P * error
+                v_right = V_BASE - K_P * error
+
+                state = (
+                    f"FOLLOW  "
+                    f"right={dist_right:.3f} "
+                    f"err={error:+.3f}"
+                )
+
+            # =================================================
+            # LIMITARE VITEZE
+            # =================================================
+
+            v_left = clamp(v_left, -MAX_SPEED, MAX_SPEED)
+            v_right = clamp(v_right, -MAX_SPEED, MAX_SPEED)
+
+            # =================================================
+            # COMANDA MOTOARE
+            # =================================================
+
+            set_velocity(
+                sim,
+                left_motor,
+                right_motor,
+                v_left,
+                v_right
+            )
+
+            # =================================================
+            # DEBUG
+            # =================================================
+
+            if current_time - last_status_time >= STATUS_PERIOD:
+
+                print(
+                    f"[{state:<30}] "
+                    f"goal={goal_distance:.3f} "
+                    f"front={dist_front:.3f} "
+                    f"right={dist_right:.3f} "
+                    f"vL={v_left:+.2f} "
+                    f"vR={v_right:+.2f}"
+                )
+
+                last_status_time = current_time
+
+            # =================================================
+
+            sensor_values = []
+
+            for i in range(16):
+                result, dist, *_ = sim.readProximitySensor(sensors[i])
+                if result:
+                    sensor_values.append(round(dist, 3))
+                else:
+                    sensor_values.append(None)
+            print(sensor_values)
+
+            time.sleep(0.05)
+            for i, d in enumerate(sensor_values):
+                print(f"S{i}: {d}")
+
+    except KeyboardInterrupt:
+
+        print("\nProgram intrerupt manual.")
+
+    finally:
+
+        set_velocity(
+            sim,
+            left_motor,
+            right_motor,
+            0.0,
+            0.0
+        )
+
+        sim.stopSimulation()
+
+        print("Simulare oprita.")
+
+
+# =========================================================
+
+if __name__ == "__main__":
     main()
