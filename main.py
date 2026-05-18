@@ -1,5 +1,6 @@
 import time
 import math
+from pathlib import Path
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
 # --- PARAMETRI GLOBALI ---
@@ -19,6 +20,21 @@ dead_ends = set()
 FRONT_SENSORS = [3, 4]       
 LEFT_SENSORS = [0, 1, 14, 15]
 RIGHT_SENSORS = [6, 7, 8, 9] 
+
+
+def ensure_pioneer_model(sim):
+    """Returneaza handle-urile robotului, incarcand modelul daca lipseste din scena."""
+    try:
+        robot = sim.getObject('/PioneerP3DX')
+    except Exception:
+        model_path = Path(__file__).resolve().parent / 'models' / 'PioneerP3DX.ttm'
+        sim.loadModel(str(model_path))
+        robot = sim.getObject('/PioneerP3DX')
+
+    left_motor = sim.getObject('/PioneerP3DX/leftMotor')
+    right_motor = sim.getObject('/PioneerP3DX/rightMotor')
+    sensors = [sim.getObject(f'/PioneerP3DX/ultrasonicSensor[{i}]') for i in range(16)]
+    return robot, left_motor, right_motor, sensors
 
 def discretize_pos(pos):
     """Transforma o coordonata continua intr-un nod de grila pentru memorie."""
@@ -50,11 +66,8 @@ def main():
     client = RemoteAPIClient()
     sim = client.require('sim')
 
-    # Obtinere handle-uri
-    robot = sim.getObject('/PioneerP3DX')
-    left_motor = sim.getObject('/PioneerP3DX/leftMotor')
-    right_motor = sim.getObject('/PioneerP3DX/rightMotor')
-    sensors = [sim.getObject(f'/PioneerP3DX/ultrasonicSensor[{i}]') for i in range(16)]
+    # Obtinere handle-uri; daca modelul nu exista in scena, il incarcam din workspace.
+    robot, left_motor, right_motor, sensors = ensure_pioneer_model(sim)
 
     sim.startSimulation()
     print("=== START EXPLORARE LABIRINT ===")
