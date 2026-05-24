@@ -1,353 +1,398 @@
-import time
-import math
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+# ============================================================
+#  CoppeliaSim Maze Solver (Remote API)
+#  Improved Left-Wall Follower with:
+#   - loop detection
+#   - progress watchdog
+#   - aggressive recovery
+#   - corridor centering
+#   - PID stabilization
+# ============================================================
 
-# =========================================================
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+import math
+import time
+
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
 START_POS = [8.425, 10.925, 0.139]
 FINISH_POS = [-0.550, 3.375]
 
-FORWARD_SPEED = 1.2
-TURN_GAIN = 0.8
+GOAL_TOLERANCE = 0.45
 
-WALL_DISTANCE = 0.45
-FRONT_THRESHOLD = 0.6
+TARGET_LEFT_DIST = 0.35
 
-TARGET_RADIUS = 0.3
+FRONT_BRAKE_DIST = 0.28
+FRONT_SLOW_DIST = 0.45
 
-# =========================================================
-# SENSOR GROUPS
-# =========================================================
+BASE_SPEED = 2.0
 
-FRONT_SENSORS = [3, 4]
-LEFT_SENSORS = [0, 1, 14, 15]
-RIGHT_SENSORS = [6, 7, 8, 9]
+KP = 0.7
+KI = 0.0
+KD = 0.15
 
-# =========================================================
-# ROBOT SETUP
-# =========================================================
+# ============================================================
+# MAZE SOLVER
+# ============================================================
 
-def ensure_pioneer(sim):
+class MazeSolver:
 
-    robot = sim.getObject('/PioneerP3DX')
+    def __init__(self):
 
-    left_motor = sim.getObject('/PioneerP3DX/leftMotor')
-    right_motor = sim.getObject('/PioneerP3DX/rightMotor')
+        client = RemoteAPIClient()
+        self.sim = client.require('sim')
 
-    sensors = [
-        sim.getObject(f'/PioneerP3DX/ultrasonicSensor[{i}]')
-        for i in range(16)
-    ]
+        # ----------------------------------------------------
+        # OBJECTS
+        # ----------------------------------------------------
 
-    return robot, left_motor, right_motor, sensors
+        self.robot = self.sim.getObject('/PioneerP3DX')
 
-# =========================================================
-# SENSOR HELPERS
-# =========================================================
-
-def get_min_distance(sim, sensors, indices):
-
-    min_dist = 999
-
-    for idx in indices:
-
-        result, dist, *_ = sim.readProximitySensor(
-            sensors[idx]
+        self.left_motor = self.sim.getObject(
+            '/PioneerP3DX/leftMotor'
         )
 
-        if result:
-            min_dist = min(min_dist, dist)
-
-    return min_dist
-
-# =========================================================
-# TARGET CHECK
-# =========================================================
-
-def reached_goal(pos):
-
-    dx = FINISH_POS[0] - pos[0]
-    dy = FINISH_POS[1] - pos[1]
-
-    dist = math.sqrt(dx * dx + dy * dy)
-
-    return dist < TARGET_RADIUS
-
-# =========================================================
-# M-LINE CHECK
-# linia START -> FINISH
-# =========================================================
-
-def distance_to_mline(x, y):
-
-    x1 = START_POS[0]
-    y1 = START_POS[1]
-
-    x2 = FINISH_POS[0]
-    y2 = FINISH_POS[1]
-
-    numerator = abs(
-        (y2 - y1) * x
-        - (x2 - x1) * y
-        + x2 * y1
-        - y2 * x1
-    )
-
-    denominator = math.sqrt(
-        (y2 - y1) ** 2
-        + (x2 - x1) ** 2
-    )
-
-    return numerator / denominator
-
-# =========================================================
-# GO TO GOAL
-# =========================================================
-
-def go_to_goal(sim, robot, left_motor, right_motor):
-
-    pos = sim.getObjectPosition(
-        robot,
-        sim.handle_world
-    )
-
-    ori = sim.getObjectOrientation(
-        robot,
-        sim.handle_world
-    )
-
-    rx = pos[0]
-    ry = pos[1]
-
-    yaw = ori[2]
-
-    dx = FINISH_POS[0] - rx
-    dy = FINISH_POS[1] - ry
-
-    desired_angle = math.atan2(dy, dx)
-
-    angle_error = desired_angle - yaw
-
-    while angle_error > math.pi:
-        angle_error -= 2 * math.pi
-
-    while angle_error < -math.pi:
-        angle_error += 2 * math.pi
-
-    angular = TURN_GAIN * angle_error
-
-    left_speed = FORWARD_SPEED - angular
-    right_speed = FORWARD_SPEED + angular
-
-    left_speed = max(min(left_speed, 3), -3)
-    right_speed = max(min(right_speed, 3), -3)
-
-    sim.setJointTargetVelocity(
-        left_motor,
-        left_speed
-    )
-
-    sim.setJointTargetVelocity(
-        right_motor,
-        right_speed
-    )
-
-# =========================================================
-# WALL FOLLOWING
-# =========================================================
-
-def follow_wall(
-    sim,
-    sensors,
-    left_motor,
-    right_motor
-):
-
-    d_front = get_min_distance(
-        sim,
-        sensors,
-        FRONT_SENSORS
-    )
-
-    d_left = get_min_distance(
-        sim,
-        sensors,
-        LEFT_SENSORS
-    )
-
-    # obstacle directly ahead
-    if d_front < FRONT_THRESHOLD:
-
-        left_speed = 1.5
-        right_speed = -1.0
-
-    else:
-
-        # maintain wall distance
-        error = WALL_DISTANCE - d_left
-
-        correction = 3.0 * error
-
-        left_speed = 1.8 - correction
-        right_speed = 1.8 + correction
-
-    left_speed = max(min(left_speed, 3), -3)
-    right_speed = max(min(right_speed, 3), -3)
-
-    sim.setJointTargetVelocity(
-        left_motor,
-        left_speed
-    )
-
-    sim.setJointTargetVelocity(
-        right_motor,
-        right_speed
-    )
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    client = RemoteAPIClient()
-
-    sim = client.require('sim')
-
-    robot, left_motor, right_motor, sensors = ensure_pioneer(sim)
-
-    sim.startSimulation()
-
-    try:
-
-        print("=== BUG2 MAZE SOLVER START ===")
-
-        sim.setObjectPosition(
-            robot,
-            sim.handle_world,
-            START_POS
+        self.right_motor = self.sim.getObject(
+            '/PioneerP3DX/rightMotor'
         )
 
-        sim.setObjectOrientation(
-            robot,
-            sim.handle_world,
-            [0, 0, 0]
+        # ultrasonic sensors
+        self.sensors = []
+
+        for i in range(16):
+            sensor = self.sim.getObject(
+                f'/PioneerP3DX/ultrasonicSensor[{i}]'
+            )
+            self.sensors.append(sensor)
+
+        # ----------------------------------------------------
+        # PID
+        # ----------------------------------------------------
+
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+        # ----------------------------------------------------
+        # LOOP DETECTION
+        # ----------------------------------------------------
+
+        self.visited = set()
+
+        # ----------------------------------------------------
+        # PROGRESS WATCHDOG
+        # ----------------------------------------------------
+
+        self.best_distance = 9999
+        self.last_progress_time = time.time()
+
+    # ========================================================
+    # HELPERS
+    # ========================================================
+
+    def set_velocity(self, left, right):
+
+        self.sim.setJointTargetVelocity(
+            self.left_motor,
+            left
         )
 
-        time.sleep(1)
+        self.sim.setJointTargetVelocity(
+            self.right_motor,
+            right
+        )
 
-        mode = "GOAL"
+    # --------------------------------------------------------
 
-        hit_point_distance = None
+    def get_position(self):
 
-        while True:
+        pos = self.sim.getObjectPosition(
+            self.robot,
+            -1
+        )
 
-            pos = sim.getObjectPosition(
-                robot,
-                sim.handle_world
+        return pos
+
+    # --------------------------------------------------------
+
+    def distance_to_goal(self, pos):
+
+        dx = FINISH_POS[0] - pos[0]
+        dy = FINISH_POS[1] - pos[1]
+
+        return math.sqrt(dx * dx + dy * dy)
+
+    # --------------------------------------------------------
+
+    def get_cell(self, pos, cell_size=0.5):
+
+        return (
+            round(pos[0] / cell_size),
+            round(pos[1] / cell_size)
+        )
+
+    # --------------------------------------------------------
+
+    def read_sensors(self):
+
+        dists = []
+
+        for sensor in self.sensors:
+
+            result, distance, _, _, _ = (
+                self.sim.readProximitySensor(sensor)
             )
 
-            rx = pos[0]
-            ry = pos[1]
-
-            # =============================================
-            # SUCCESS
-            # =============================================
-
-            if reached_goal(pos):
-
-                print("=== GOAL REACHED ===")
-
-                break
-
-            # =============================================
-            # SENSOR READ
-            # =============================================
-
-            d_front = get_min_distance(
-                sim,
-                sensors,
-                FRONT_SENSORS
-            )
-
-            # =============================================
-            # GO TO GOAL MODE
-            # =============================================
-
-            if mode == "GOAL":
-
-                if d_front < FRONT_THRESHOLD:
-
-                    print("Obstacle hit -> WALL mode")
-
-                    mode = "WALL"
-
-                    dx = FINISH_POS[0] - rx
-                    dy = FINISH_POS[1] - ry
-
-                    hit_point_distance = math.sqrt(
-                        dx * dx + dy * dy
-                    )
-
-                else:
-
-                    go_to_goal(
-                        sim,
-                        robot,
-                        left_motor,
-                        right_motor
-                    )
-
-            # =============================================
-            # WALL FOLLOW MODE
-            # =============================================
-
+            if result:
+                dists.append(distance)
             else:
+                dists.append(0.8)
 
-                follow_wall(
-                    sim,
-                    sensors,
-                    left_motor,
-                    right_motor
+        return dists
+
+    # --------------------------------------------------------
+
+    def compute_left_distance(self, dists):
+
+        left_indices = [0, 1, 2, 3]
+
+        vals = [dists[i] for i in left_indices]
+
+        return min(vals)
+
+    # ========================================================
+    # CONTROL LOOP
+    # ========================================================
+
+    def solve(self):
+
+        print("\n==============================")
+        print(" STARTING MAZE SOLVER ")
+        print("==============================\n")
+
+        self.sim.startSimulation()
+
+        time.sleep(1.0)
+
+        try:
+
+            while True:
+
+                # ============================================
+                # POSITION
+                # ============================================
+
+                pos = self.get_position()
+
+                dist_finish = self.distance_to_goal(pos)
+
+                print(
+                    f"[POS] x={pos[0]:.3f} "
+                    f"y={pos[1]:.3f} "
+                    f"dist_finish={dist_finish:.3f}"
                 )
 
-                # near m-line again?
-                mline_dist = distance_to_mline(rx, ry)
+                # ============================================
+                # GOAL REACHED
+                # ============================================
 
-                dx = FINISH_POS[0] - rx
-                dy = FINISH_POS[1] - ry
+                if dist_finish < GOAL_TOLERANCE:
 
-                current_goal_dist = math.sqrt(
-                    dx * dx + dy * dy
-                )
+                    print("\n================================")
+                    print(" MAZE SOLVED!")
+                    print("================================\n")
 
-                # leave obstacle
+                    self.set_velocity(0, 0)
+                    break
+
+                # ============================================
+                # LOOP DETECTION
+                # ============================================
+
+                cell = self.get_cell(pos)
+
+                repeated = cell in self.visited
+
+                if not repeated:
+                    self.visited.add(cell)
+
+                # ============================================
+                # PROGRESS WATCHDOG
+                # ============================================
+
+                if dist_finish < self.best_distance:
+
+                    self.best_distance = dist_finish
+                    self.last_progress_time = time.time()
+
+                stuck_timeout = 12.0
+
                 if (
-                    mline_dist < 0.2
-                    and current_goal_dist < hit_point_distance
+                    time.time() - self.last_progress_time
+                    > stuck_timeout
                 ):
 
-                    print("Back to GOAL mode")
+                    print("\n[RECOVERY] STUCK")
+                    print("Executing escape maneuver...\n")
 
-                    mode = "GOAL"
+                    # reverse
+                    self.set_velocity(-2.0, -2.0)
+                    time.sleep(1.2)
 
-            time.sleep(0.05)
+                    # strong left turn
+                    self.set_velocity(-2.5, 2.5)
+                    time.sleep(2.2)
 
-    except KeyboardInterrupt:
+                    self.last_progress_time = time.time()
 
-        print("STOPPED")
+                    continue
 
-    finally:
+                # ============================================
+                # SENSOR READ
+                # ============================================
 
-        sim.setJointTargetVelocity(left_motor, 0)
-        sim.setJointTargetVelocity(right_motor, 0)
+                dists = self.read_sensors()
 
-        sim.stopSimulation()
+                # front sensors
+                front_indices = [3, 4, 5]
 
-# =========================================================
+                front_min = min(
+                    [dists[i] for i in front_indices]
+                )
+
+                # ============================================
+                # WALL FOLLOW
+                # ============================================
+
+                left_dist = min(
+                    self.compute_left_distance(dists),
+                    0.8
+                )
+
+                error = TARGET_LEFT_DIST - left_dist
+
+                self.integral += error
+
+                derivative = error - self.prev_error
+
+                self.prev_error = error
+
+                steer = (
+                    KP * error
+                    + KI * self.integral
+                    + KD * derivative
+                )
+
+                # ============================================
+                # CORRIDOR CENTERING
+                # ============================================
+
+                front_left = min(
+                    dists[1],
+                    dists[2],
+                    dists[3]
+                )
+
+                front_right = min(
+                    dists[4],
+                    dists[5],
+                    dists[6]
+                )
+
+                corridor_error = (
+                    front_right - front_left
+                )
+
+                steer += corridor_error * 0.4
+
+                # ============================================
+                # BEHAVIOR LOGIC
+                # ============================================
+
+                state = "FOLLOW"
+
+                # HARD TURN
+                if front_min < FRONT_BRAKE_DIST:
+
+                    v_left = -2.5
+                    v_right = 2.5
+
+                    state = "TURN"
+
+                # SLOW TURN
+                elif front_min < FRONT_SLOW_DIST:
+
+                    v_left = 0.3
+                    v_right = 1.8
+
+                    state = "SLOW"
+
+                # NORMAL FOLLOW
+                else:
+
+                    v_left = BASE_SPEED + steer
+                    v_right = BASE_SPEED - steer
+
+                # ============================================
+                # LOOP ESCAPE
+                # ============================================
+
+                if repeated:
+
+                    print("[LOOP] Revisited cell")
+
+                    v_left -= 0.8
+                    v_right += 0.8
+
+                # ============================================
+                # CLAMP SPEEDS
+                # ============================================
+
+                v_left = max(min(v_left, 3.0), -3.0)
+                v_right = max(min(v_right, 3.0), -3.0)
+
+                # ============================================
+                # DEBUG
+                # ============================================
+
+                print(
+                    f"[{state:^7}] "
+                    f"left={left_dist:.3f} "
+                    f"front={front_min:.3f} "
+                    f"err={error:.3f} "
+                    f"vL={v_left:+.2f} "
+                    f"vR={v_right:+.2f}"
+                )
+
+                # ============================================
+                # APPLY VELOCITIES
+                # ============================================
+
+                self.set_velocity(v_left, v_right)
+
+                time.sleep(0.05)
+
+        except KeyboardInterrupt:
+
+            print("\nInterrupted by user")
+
+        finally:
+
+            self.set_velocity(0, 0)
+
+            time.sleep(0.2)
+
+            self.sim.stopSimulation()
+
+            print("\nSimulation stopped")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
 
-    main()
+    solver = MazeSolver()
+
+    solver.solve()
